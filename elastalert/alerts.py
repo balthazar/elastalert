@@ -208,6 +208,13 @@ class Alerter(object):
         """
         raise NotImplementedError()
 
+    def resolve(self):
+        """ Resolve a previous alert. Match is a dictionary of information about the alert.
+
+        :param match: A dictionary of relevant information to the alert.
+        """
+        raise NotImplementedError()
+
     def get_info(self):
         """ Returns a dictionary of data related to this alert. At minimum, this should contain
         a field type corresponding to the type of Alerter. """
@@ -1152,10 +1159,7 @@ class SlackAlerter(Alerter):
             alert_fields.append(arg)
         return alert_fields
 
-    def alert(self, matches):
-        body = self.create_alert_body(matches)
-
-        body = self.format_body(body)
+    def send_message(self, attachments):
         # post to slack
         headers = {'content-type': 'application/json'}
         # set https proxy, if it was provided
@@ -1164,15 +1168,7 @@ class SlackAlerter(Alerter):
             'username': self.slack_username_override,
             'parse': self.slack_parse_override,
             'text': self.slack_text_string,
-            'attachments': [
-                {
-                    'color': self.slack_msg_color,
-                    'title': self.create_title(matches),
-                    'text': body,
-                    'mrkdwn_in': ['text', 'pretext'],
-                    'fields': []
-                }
-            ]
+            'attachments': attachments
         }
 
         # if we have defined fields, populate noteable fields for the alert
@@ -1210,15 +1206,41 @@ class SlackAlerter(Alerter):
                         requests.packages.urllib3.disable_warnings()
                     payload['channel'] = channel_override
                     response = requests.post(
-                        url, data=json.dumps(payload, cls=DateTimeEncoder),
-                        headers=headers, verify=verify,
-                        proxies=proxies,
-                        timeout=self.slack_timeout)
+                            url, data=json.dumps(payload, cls=DateTimeEncoder),
+                            headers=headers, verify=verify,
+                            proxies=proxies,
+                            timeout=self.slack_timeout)
                     warnings.resetwarnings()
                     response.raise_for_status()
                 except RequestException as e:
                     raise EAException("Error posting to slack: %s" % e)
+
+    def alert(self, matches):
+        body = self.format_body(self.create_alert_body(matches))
+
+        self.send_message([
+            {
+                'color': self.slack_msg_color,
+                'title': self.create_title(matches),
+                'text': body,
+                'mrkdwn_in': ['text', 'pretext'],
+                'fields': []
+            }
+        ])
+
         elastalert_logger.info("Alert '%s' sent to Slack" % self.rule['name'])
+
+    def resolve(self, key_value):
+        self.send_message([
+            {
+                'color': 'good',
+                'title': self.rule['name'],
+                'text': '%sAlert resolved' % ('[%s] ' % key_value if key_value else ''),
+                'fields': []
+            }
+        ])
+
+        logging.info("Resolve message sent to Slack")
 
     def get_info(self):
         return {'type': 'slack',

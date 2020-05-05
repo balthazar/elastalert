@@ -54,6 +54,17 @@ from .util import ts_now
 from .util import ts_to_dt
 from .util import unix_to_dt
 
+def get(obj, path):
+    x = obj
+    keys = path.split(".")
+    for key in keys:
+        if isinstance(x, list):
+            x = x[int(key)]
+        else:
+            x = x[key]
+    return x
+
+resolved_alerts = {}
 
 class ElastAlerter(object):
     """ The main ElastAlert runner. This class holds all state about active rules,
@@ -907,8 +918,14 @@ class ElastAlerter(object):
             self.thread_data.cumulative_hits += self.thread_data.num_hits
             rule['type'].garbage_collect(endtime)
 
-        # Process any new matches
         num_matches = len(rule['type'].matches)
+
+        # Resolve alerts
+        if num_matches == 0:
+            starttime = rule['original_starttime'] - datetime.timedelta(seconds=5)
+            self.resolve_active_alerts(rule, starttime, endtime)
+
+        # Process new matches
         while rule['type'].matches:
             match = rule['type'].matches.pop(0)
             match['num_hits'] = self.thread_data.cumulative_hits
@@ -963,6 +980,56 @@ class ElastAlerter(object):
         self.writeback('elastalert_status', body)
 
         return num_matches
+
+    def resolve_active_alerts(self, rule, start, end):
+        query = {
+            'query': {
+                'bool': {
+                    'must': [
+                        {
+                            'match': {
+                                'rule_name': '%s' % rule['name']
+                            }
+                        },
+                        {
+                            'match': {
+                                'alert_sent': 'true'
+                            }
+                        },
+                        {
+                            'range': {
+                                'alert_time': {'from': dt_to_ts(start), 'to': dt_to_ts(end)}
+                            }
+                        }
+                    ]
+                }
+            }
+        }
+
+        try:
+            if self.writeback_es:
+                res = self.writeback_es.search(index=self.writeback_index, body=query)
+
+                if get(res, 'hits.total.value') > 0:
+                    alert_id = get(res, 'hits.hits.0._id')
+
+                    if resolved_alerts.get(alert_id) == None:
+                        resolved_alerts[alert_id] = True
+                        key_value = rule['query_key'] and get(res, 'hits.hits.0._source.match_body.%s' % rule['query_key'])
+
+                        for alert in rule['alert']:
+                            try:
+                                alert.resolve(key_value)
+                            except EAException as e:
+                                self.handle_error('Error while resolving alert %s: %s' % (alert.get_info()['type'], e), {'rule': rule['name']})
+                                alert_exception = str(e)
+                            else:
+                                self.thread_data.alerts_sent += 1
+                                alert_sent = True
+        except (ElasticsearchException, KeyError) as e:
+            self.handle_error('Error querying for last alerts: %s' % (e), {'rule': rule['name']})
+
+        return None
 
     def init_rule(self, new_rule, new=True):
         ''' Copies some necessary non-config state from an exiting rule to a new rule. '''
